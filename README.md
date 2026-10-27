@@ -219,9 +219,15 @@ that is standard CPython behavior, not extra buffering by `dedupe`.
 
 ## Tests
 
-There is no automated test suite in the repo yet. The verification used
-while writing this README (and reproducible by you) is copy-paste per
-behavior:
+The test suite is standard-library only and runs with:
+
+```sh
+make test
+```
+
+(equivalent: `python3 tests/test_dedupe.py`; it runs 29 tests and was last
+verified green against this README's examples). The same behaviors are
+reproducible copy-paste per command:
 
 ```sh
 git clone https://github.com/igorjpimenta/dedupe.git && cd dedupe && chmod +x dedupe
