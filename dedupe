@@ -1,21 +1,226 @@
 #!/usr/bin/env python3
-"""dedupe - streaming duplicate line remover (scaffold placeholder).
+"""dedupe - streaming duplicate line remover.
 
-Full implementation lands in TASK-spptfb (Implement dedupe CLI).
-This stub exists so the repo has an executable entrypoint at root.
+Reads lines from stdin (no args, or `-`) or file args in order.
+Strips the trailing newline only; all other content (leading/trailing
+spaces, tabs, \\r) is preserved and significant for identity, except for
+the blank-collapse rule below.
+
+Modes:
+  --keep-first (default): emit each distinct line once, at its first
+      occurrence. Emits immediately while reading (works on infinite input).
+  --keep-last: emit each distinct line once, ordered by the position of its
+      LAST occurrence.
+      DECISION (spelling + streaming): input is still read line-by-line and
+      only O(unique) state is held -- map key -> {count, first_spelling,
+      last_spelling, first_order, last_order}. Nothing else is buffered (no
+      read()/readlines()/list(input)); output is deferred until EOF and then
+      emitted in last-occurrence order. For case-sensitive dups all spellings
+      are identical so spelling is moot; with --ignore-case the LAST-seen
+      spelling is emitted (documented below).
+  --count: prefix each emitted line with "<total count>\\t".
+      DECISION (ordering): --count defers output until EOF (totals are only
+      known then) and follows the active keep mode: first-occurrence order
+      by default / --keep-first, last-occurrence order with --keep-last.
+      Output stays unique (one line per key).
+
+Blank lines: any line whose .strip() == '' (empty or whitespace-only) folds
+into a single blank key. It collapses to ONE empty line ("") total.
+  DECISION: the collapsed blank is emitted at the FIRST blank position
+  regardless of --keep-first/--keep-last (literal spec reading; simpler and
+  predictable). Its count still reflects all blank lines when --count is on.
+
+--ignore-case: dedupe key is line.casefold() (blanks exempt -- they always
+use the blank key). Output preserves the first-seen spelling with
+--keep-first (default), or the last-seen spelling with --keep-last.
+  DECISION: last-seen spelling under --keep-last, first-seen otherwise.
+
+Exit codes:
+  0 success (including -h/--help, usage on stdout).
+  1 missing/unreadable input file (message on stderr). DECISION: all other
+      inputs are still processed; exit 1 if ANY file failed.
+  2 unknown flag (message on stderr). No flag takes a value; any argv entry
+      starting with '-' other than exactly '-' or a known flag is an unknown
+      flag. There are no missing-value cases since no flag takes a value.
+
+Streaming: input is consumed line-by-line via `for line in stream` over
+sys.stdin or open(path, 'r', encoding='utf-8', errors='replace'). Only the
+dedupe map is held; the full input is never buffered.
 """
+
 import sys
+
+USAGE = """Usage: dedupe [--keep-first|--keep-last] [--count] [--ignore-case] [FILE...]
+  Read lines from stdin (no args or `-`) or FILE args in order.
+  Strip trailing newline only, preserve other content.
+  --keep-first   emit first occurrence (default)
+  --keep-last    emit once, ordered by last occurrence (input still streaming)
+  --count        prefix each unique line with "<count>\\t"
+  --ignore-case  compare case-insensitively; emit first-seen spelling
+                 (last-seen with --keep-last)
+  -h, --help     show this usage on stdout, exit 0
+Blanks (strip()=='') collapse to a single empty line at first blank position.
+Unknown flags -> stderr, exit 2. Missing/unreadable file -> stderr, exit 1."""
+
+KNOWN_FLAGS = {
+    "--keep-first": "keep_first",
+    "--keep-last": "keep_last",
+    "--count": "count",
+    "--ignore-case": "ignore_case",
+    "-h": "help",
+    "--help": "help",
+}
+
+
+def parse_args(argv):
+    """Split argv into (options, inputs). Exit 2 on unknown flags."""
+    keep = "first"  # or "last"
+    count = False
+    ignore_case = False
+    want_help = False
+    inputs = []
+    for tok in argv:
+        if tok == "-":
+            inputs.append(tok)
+        elif tok.startswith("-") and len(tok) > 1:
+            name = KNOWN_FLAGS.get(tok)
+            if name is None:
+                print("dedupe: unknown option: %s" % tok, file=sys.stderr)
+                print("dedupe: try 'dedupe --help'", file=sys.stderr)
+                return None
+            if name == "keep_first":
+                keep = "first"
+            elif name == "keep_last":
+                keep = "last"
+            elif name == "count":
+                count = True
+            elif name == "ignore_case":
+                ignore_case = True
+            elif name == "help":
+                want_help = True
+        else:
+            inputs.append(tok)
+    return {
+        "keep": keep,
+        "count": count,
+        "ignore_case": ignore_case,
+        "help": want_help,
+        "inputs": inputs,
+    }
+
+
+def line_key(line, ignore_case):
+    """Return (key, is_blank) for a newline-stripped line."""
+    if line.strip() == "":
+        return ("", True)
+    if ignore_case:
+        return (line.casefold(), False)
+    return (line, False)
+
+
+def emit(line, count_val, with_count):
+    if with_count:
+        sys.stdout.write("%d\t%s\n" % (count_val, line))
+    else:
+        sys.stdout.write("%s\n" % line)
+
+
+def run(opts):
+    keep_last = opts["keep"] == "last"
+    with_count = opts["count"]
+    ignore_case = opts["ignore_case"]
+    inputs = opts["inputs"]
+    if not inputs:
+        inputs = ["-"]
+
+    # Streaming fast path: keep-first without --count can emit immediately,
+    # so unbounded input uses O(unique) memory AND O(1) latency. Every other
+    # mode defers output until EOF (counts / last positions need full input)
+    # but still reads line-by-line holding only the map below.
+    streaming_emit = not keep_last and not with_count
+
+    # key -> [count, first_spelling, last_spelling, first_order, last_order]
+    # Blank key "" always has spellings "" (collapsed to empty line).
+    seen = {}
+    order = 0
+    file_error = False
+
+    def handle_stream(stream):
+        nonlocal order
+        for raw in stream:
+            # Strip trailing newline only; preserve everything else.
+            line = raw[:-1] if raw.endswith("\n") else raw
+            # (A trailing \r, if present, is content and preserved.)
+            key, is_blank = line_key(line, ignore_case)
+            entry = seen.get(key)
+            if entry is None:
+                spelling = "" if is_blank else line
+                seen[key] = [1, spelling, spelling, order, order]
+                if streaming_emit:
+                    emit(spelling, 1, False)
+            else:
+                entry[0] += 1
+                if is_blank:
+                    # Blank stays pinned at FIRST blank position even under
+                    # --keep-last (spec-literal); only the count grows.
+                    pass
+                else:
+                    entry[2] = line  # last-seen spelling (ignore-case)
+                    entry[4] = order
+            order += 1
+
+    stdin_used = False
+    for path in inputs:
+        if path == "-":
+            # Each '-' reads stdin from its current position; a second '-'
+            # sees EOF (standard behaviour). Read once per occurrence.
+            handle_stream(sys.stdin)
+            stdin_used = True
+        else:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    handle_stream(fh)
+            except (FileNotFoundError, PermissionError, IsADirectoryError,
+                    UnicodeError, OSError) as exc:
+                print("dedupe: cannot read '%s': %s" % (path, exc),
+                      file=sys.stderr)
+                file_error = True
+    # Silence unused-var warning intent: stdin default when no args is covered
+    # by inputs == ["-"] above; flag kept for clarity.
+    _ = stdin_used
+
+    if not streaming_emit:
+        if keep_last:
+            ordered = sorted(seen.values(), key=lambda e: e[4])
+        else:
+            ordered = sorted(seen.values(), key=lambda e: e[3])
+        for count_val, first_sp, last_sp, _, _ in ordered:
+            spelling = last_sp if keep_last else first_sp
+            emit(spelling, count_val, with_count)
+
+    return 1 if file_error else 0
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if "-h" in argv or "--help" in argv:
-        print("Usage: dedupe [--keep-first|--keep-last] [--count] [--ignore-case] [FILE...]")
-        print("  Reads stdin or FILEs, emits unique lines (streaming).")
-        print("  Full implementation pending (TASK-spptfb).")
+    opts = parse_args(argv)
+    if opts is None:
+        return 2
+    if opts["help"]:
+        print(USAGE)
         return 0
-    print("dedupe: scaffold placeholder - implementation pending (TASK-spptfb)", file=sys.stderr)
-    return 0
+    try:
+        return run(opts)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+        return 0
 
 
 if __name__ == "__main__":
