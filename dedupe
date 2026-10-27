@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""dedupe - streaming duplicate line remover (scaffold placeholder).
+
+Full implementation lands in TASK-spptfb (Implement dedupe CLI).
+This stub exists so the repo has an executable entrypoint at root.
+"""
+import sys
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if "-h" in argv or "--help" in argv:
+        print("Usage: dedupe [--keep-first|--keep-last] [--count] [--ignore-case] [FILE...]")
+        print("  Reads stdin or FILEs, emits unique lines (streaming).")
+        print("  Full implementation pending (TASK-spptfb).")
+        return 0
+    print("dedupe: scaffold placeholder - implementation pending (TASK-spptfb)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
